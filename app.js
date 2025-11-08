@@ -1,4 +1,5 @@
 require('dotenv').config();
+
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
@@ -8,128 +9,137 @@ const MongoStore = require('connect-mongo');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Connect to MongoDB ---
-mongoose.connect(process.env.MONGO_URI, {
+const MONGO_URI = process.env.MONGO_URI;
+const SESSION_SECRET = process.env.SESSION_SECRET;
+
+if (!MONGO_URI) {
+  console.error('ERROR: MONGO_URI environment variable not set.');
+  process.exit(1);
+}
+if (!SESSION_SECRET) {
+  console.error('ERROR: SESSION_SECRET environment variable not set.');
+  process.exit(1);
+}
+
+// Connect to MongoDB
+mongoose.connect(MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
 })
 .then(() => console.log('MongoDB connected'))
-.catch(err => console.error('MongoDB connection error:', err));
+.catch(err => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1);
+});
 
-// --- User Schema ---
+// Define User schema
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  isMember: { type: Boolean, default: false },
-  avatar: { type: String, default: 'https://i.pravatar.cc/150' },
-  posts: [
-    {
-      content: String,
-      createdAt: { type: Date, default: Date.now }
-    }
-  ]
+  isMember: { type: Boolean, default: false }
 });
 
 const User = mongoose.model('User', userSchema);
 
-// --- Middleware ---
+// Middleware
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());   // in case you ever need JSON
 app.use(express.static('public'));
 app.set('view engine', 'ejs');
 
-// --- Sessions ---
+// Session configuration
 app.use(session({
-  secret: process.env.SESSION_SECRET,
+  secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
+  store: MongoStore.create({ mongoUrl: MONGO_URI }),
+  cookie: { maxAge: 1000 * 60 * 60 * 24 }  // 1 day
 }));
 
-// --- Auth Middleware ---
+// Authentication check
 function checkAuth(req, res, next) {
-  if (req.session.userId) return next();
-  res.redirect('/login');
+  if (req.session && req.session.userId) {
+    return next();
+  }
+  return res.redirect('/login');
 }
 
-// --- Routes ---
-
-// Home
+// Routes
 app.get('/', (req, res) => {
   res.render('index', { user: req.session.user });
 });
 
-// Register
-app.get('/register', (req, res) => res.render('register'));
+app.get('/register', (req, res) => {
+  res.render('register');
+});
+
 app.post('/register', async (req, res) => {
   const { username, password } = req.body;
   try {
-    const existingUser = await User.findOne({ username });
-    if (existingUser) return res.send('Username already exists');
-
-    const hashedPassword = await bcrypt.hash(password, 12);
-    const avatarUrl = `https://i.pravatar.cc/150?img=${Math.floor(Math.random() * 70) + 1}`;
-
-    const user = new User({ username, password: hashedPassword, avatar: avatarUrl });
+    if (!username || !password) {
+      return res.send('Username and password are required.');
+    }
+    const existing = await User.findOne({ username });
+    if (existing) {
+      return res.send('Username already taken.');
+    }
+    const hashed = await bcrypt.hash(password, 12);
+    const user = new User({ username, password: hashed });
     await user.save();
 
+    // Set session
     req.session.userId = user._id;
-    req.session.user = user;
+    req.session.user = { username: user.username, isMember: user.isMember };
 
-    res.redirect('/members');
+    return res.redirect('/members');
   } catch (err) {
-    console.error(err);
-    res.send('Error registering user');
+    console.error('Register error:', err);
+    return res.send('Error registering user.');
   }
 });
 
-// Login
-app.get('/login', (req, res) => res.render('login'));
+app.get('/login', (req, res) => {
+  res.render('login');
+});
+
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
   try {
+    if (!username || !password) {
+      return res.send('Username and password are required.');
+    }
     const user = await User.findOne({ username });
-    if (!user) return res.send('Invalid username or password');
+    if (!user) {
+      return res.send('Invalid username or password.');
+    }
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.send('Invalid username or password.');
+    }
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.send('Invalid username or password');
-
+    // Set session
     req.session.userId = user._id;
-    req.session.user = user;
+    req.session.user = { username: user.username, isMember: user.isMember };
 
-    res.redirect('/members');
+    return res.redirect('/members');
   } catch (err) {
-    console.error(err);
-    res.send('Error logging in');
+    console.error('Login error:', err);
+    return res.send('Error logging in.');
   }
 });
 
-// Logout
 app.get('/logout', (req, res) => {
   req.session.destroy(err => {
-    if (err) console.error(err);
+    if (err) console.error('Session destroy error:', err);
     res.redirect('/');
   });
 });
 
-// Members page
-app.get('/members', checkAuth, async (req, res) => {
-  const user = await User.findById(req.session.userId);
-  res.render('members', { user });
-});
-
-// Add a post
-app.post('/members/post', checkAuth, async (req, res) => {
-  const { content } = req.body;
-  try {
-    const user = await User.findById(req.session.userId);
-    user.posts.unshift({ content });
-    await user.save();
-    res.redirect('/members');
-  } catch (err) {
-    console.error(err);
-    res.send('Error posting message');
-  }
+app.get('/members', checkAuth, (req, res) => {
+  res.render('members', { user: req.session.user });
 });
 
 // Start server
-app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
